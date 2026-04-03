@@ -3,256 +3,175 @@
 #include "system.h"
 #include "math_handling.h"
 
-// ═══════════════════════════════════════════════════════════════
-//  PIN
-// ═══════════════════════════════════════════════════════════════
-#define PIN_CALDO         35   // ADC  — CN-106 riscaldamento 0-24V
-#define PIN_FREDDO         4   // DIG  — CN-105 raffreddamento (relè invertito)
-#define PIN_POT_RITORNO   33   // ADC  — potenziometro temp. ritorno (T rete)
+// ==============================================================
+//  PARAMETRI MODIFICABILI DA SERIALE (Valori di Avvio)
+// ==============================================================
+float p_temp_rete    = 15.0f;    // [T] Temp acqua di rete fredda (°C)
+float p_portata      = 20.0f;    // [L] Portata in circolo (L/min)
+float p_massa_acqua  = 15.0f;    // [A] Massa d'acqua nel serbatoio interno (Kg)
+float p_pot_risc     = 12000.0f; // [R] Potenza Riscaldante Macchina (W)
+float p_pot_raff     = 20000.0f; // [F] Potenza Raffreddante Macchina (W)
 
-#define CS_USCITA          5   // MCP4261 #1 → BT52-1 (temp uscita) → CN-114
-#define CS_RITORNO        25   // MCP4261 #2 → BT51-1 (temp ritorno) → CN-215
+// CARICO DEL PROCESSO 
+float p_pot_stampo   = 0.0f;     // [S] Potenza del processo in Watt (+ scalda, - raffredda)
 
-// ── FISICA ────────────────────────────────────────────────────
-// Tutte le costanti derivano dalla fisica reale dell'ETP HT 06/12
-// e vengono SCALATE a run-time con i valori inseriti dal Serial
+// ==============================================================
+//  COSTANTI E STATO FISICO
+// ==============================================================
+const float CP_ACQUA   = 4186.0f;  // J/(kg*K) Calore specifico acqua
+const float T_AMBIENTE = 20.0f;    // °C dell'officina
 
-#define CP_ACQUA         4186.0f   // J/kg°C
-#define P_RISC_MAX      12000.0f   // W  (12 kW installati)
+float temp_serbatoio = T_AMBIENTE; 
 
-// Dispersione tubi: FISSA — non inserita dall'utente
-// Tubi non isolati, circuito ~0.5m², U≈10W/m²K → ~5W/°K di scarto
-// Modellata come Newton: P_disp = K_tubi * (T - T_amb)
-// K_tubi = 5 W/K → per 5kg acqua: k_s = 5/(5*4186) = 0.000239 /s
-#define K_DISPERSIONE_TUBI  0.000239f   // 1/s — NON modificabile
-#define TEMP_AMBIENTE        20.0f
-#define TEMP_MAX            400.0f
+float temp_sonda_mandata = T_AMBIENTE;
+float temp_sonda_ritorno = T_AMBIENTE;
+float adc_filtrato = 0.0f;
 
-// Inerzia sonda PT1000 (filtra il segnale verso il PID del termoreg)
-#define VELOCITA_SONDA      0.15f       // 0=sonda infinitamente lenta, 1=istantanea
+unsigned long t_last = 0;
+unsigned long t_log = 0;
 
-// Range potenziometro ritorno (= temperatura acqua di rete)
-#define T_RIT_MIN           5.0f
-#define T_RIT_MAX          60.0f
+// ==============================================================
+//  INVIO POTENZIOMETRI
+// ==============================================================
+void inviaWiper(uint8_t cs, bytes8_t passi) {
+    uint8_t w0 = constrain(passi.p1, 0, 255);
+    uint8_t w1 = constrain(passi.p2, 0, 255);
 
-// ── PARAMETRI INSERITI DAL SERIAL ────────────────────────────
-// Valorizzati con default fisicamente coerenti
-float portata_lmin    = 10.0f;   // L/min — range tipico 2-25
-float massa_acqua_kg  =  5.0f;   // kg acqua nel circuito (fisso interno)
-
-// Derivati da portata (ricalcolati ogni volta che portata cambia)
-float portata_kgs     = 0.0f;    // kg/s
-float risc_rate       = 0.0f;    // C/s a potenza 100%
-float raff_base       = 0.0f;    // C/s con ΔT=80K sullo scambiatore
-
-// ── CAMPIONAMENTO ─────────────────────────────────────────────
-const unsigned long INTERVALLO_MS = 100;
-#define N_CN106  8
-#define N_POT   16
-#define ADC_ZERO 50
-int buf_cn106[N_CN106] = {0}; int idx_cn106 = 0;
-int buf_pot[N_POT]     = {0}; int idx_pot   = 0;
-
-// ── STATO ─────────────────────────────────────────────────────
-float         temp_acqua   = TEMPERATURA_INIZIALE;
-float         temp_sonda   = TEMPERATURA_INIZIALE;
-float         temp_ritorno = T_RIT_MIN;
-unsigned long t_last       = 0;
-unsigned long t_serial     = 0;
-
-// ── FUNZIONI CALCOLO ──────────────────────────────────────────
-
-void aggiorna_parametri() {
-    portata_kgs = portata_lmin / 60.0f;
-    risc_rate   = P_RISC_MAX / (massa_acqua_kg * CP_ACQUA);
-    raff_base   = portata_kgs * CP_ACQUA * 80.0f / (massa_acqua_kg * CP_ACQUA);
-}
-
-// Potenza riscaldante istantanea [W]
-float pot_riscaldante(float frac_caldo) {
-    return frac_caldo * P_RISC_MAX;
-}
-
-// Potenza raffreddamento scambiatore [W] — Q = m_dot * Cp * ΔT
-float pot_raffreddamento(bool freddo_on, float T_usc, float T_rete) {
-    if (!freddo_on || T_usc <= T_rete) return 0.0f;
-    return portata_kgs * CP_ACQUA * (T_usc - T_rete);
-}
-
-// Potenza dispersione tubi [W] — Newton: P = K * (T-Tamb)
-float pot_dispersione_tubi(float T_usc) {
-    float dT = T_usc - TEMP_AMBIENTE;
-    if (dT <= 0.0f) return 0.0f;
-    // K_tubi = K_DISPERSIONE_TUBI * massa * Cp [W/K]
-    float K_tubi_W = K_DISPERSIONE_TUBI * massa_acqua_kg * CP_ACQUA;
-    return K_tubi_W * dT;
-}
-
-// Potenza scambio stampo [W] — bilancio: Q_in - Q_out - Q_disp = Q_stampo
-// Q_stampo = Q_risc - Q_raff - Q_disp (positivo = cede calore allo stampo)
-float pot_scambio_stampo(float Q_risc, float Q_raff, float Q_disp) {
-    return Q_risc - Q_raff - Q_disp;
-}
-
-// ── SPI ───────────────────────────────────────────────────────
-void scriviWiper(uint8_t cs, uint16_t v0, uint16_t v1) {
-    byte c0 = 0x00; if (v0 > 255) c0 |= 0x01;
-    byte c1 = 0x10; if (v1 > 255) c1 |= 0x01;
     SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
     digitalWrite(cs, LOW);
-    SPI.transfer(c0); SPI.transfer(v0 & 0xFF);
-    SPI.transfer(c1); SPI.transfer(v1 & 0xFF);
+    SPI.transfer(0x00); SPI.transfer(w0);
+    SPI.transfer(0x10); SPI.transfer(w1);
     digitalWrite(cs, HIGH);
     SPI.endTransaction();
 }
 
-float leggi_caldo() {
-    buf_cn106[idx_cn106] = analogRead(PIN_CALDO);
-    idx_cn106 = (idx_cn106 + 1) % N_CN106;
-    long s = 0; for (int i=0; i<N_CN106; i++) s += buf_cn106[i];
-    int adc = (int)(s / N_CN106);
-    if (adc < ADC_ZERO) return 0.0f;
-    float f = (float)adc * (3.9f * 7.8f / (4095.0f * 24.0f));
-    return (f > 1.0f) ? 1.0f : f;
+// ==============================================================
+//  LETTURA SEGNALE MACCHINA
+// ==============================================================
+float leggiComandoRiscaldo() {
+    int raw = analogRead(PIN_CALORE_IN);
+    if (raw < ADC_ZERO_SOGLIA) {
+        adc_filtrato += ADC_ALPHA * (0.0f - adc_filtrato);
+        return 0.0f;
+    }
+    float frac = (float)raw / ADC_CALDO_MAX;
+    frac = constrain(frac, 0.0f, 1.0f);
+    adc_filtrato += ADC_ALPHA * (frac - adc_filtrato);
+    return adc_filtrato;
 }
 
-float leggi_ritorno() {
-    buf_pot[idx_pot] = analogRead(PIN_POT_RITORNO);
-    idx_pot = (idx_pot + 1) % N_POT;
-    long s = 0; for (int i=0; i<N_POT; i++) s += buf_pot[i];
-    int adc = (int)(s / N_POT);
-    float t = T_RIT_MIN + (float)adc * (T_RIT_MAX - T_RIT_MIN) / 4095.0f;
-    if (t < T_RIT_MIN) t = T_RIT_MIN;
-    if (t > T_RIT_MAX) t = T_RIT_MAX;
-    return t;
+// ==============================================================
+//  MENU E LETTURA SERIALE
+// ==============================================================
+void stampaMenu() {
+    Serial.println("\n========= IMPOSTAZIONI SIMULATORE =========");
+    Serial.println("Digita LETTERA + VALORE (es. S5000) e premi INVIO.");
+    Serial.printf("[T] Temp Rete    : %.1f °C\n", p_temp_rete);
+    Serial.printf("[L] Portata      : %.1f L/min\n", p_portata);
+    Serial.printf("[A] Massa Acqua  : %.1f Kg/Litri\n", p_massa_acqua);
+    Serial.printf("[R] Pot. Risc.   : %.0f W\n", p_pot_risc);
+    Serial.printf("[F] Pot. Raff.   : %.0f W\n", p_pot_raff);
+    Serial.printf("[S] Pot. Processo: %.0f W (Positivo = Scalda l'acqua, Negativo = Raffredda)\n", p_pot_stampo);
+    Serial.println("=========================================\n");
 }
 
-// ── GESTIONE SERIAL MONITOR ───────────────────────────────────
-void stampa_menu() {
-    Serial.println();
-    Serial.println("╔═══════════════════════════════════════╗");
-    Serial.println("║   CONFIGURAZIONE TERMOREGOLATORE      ║");
-    Serial.println("╠═══════════════════════════════════════╣");
-    Serial.print  ("║ Portata attuale     : ");
-    Serial.print(portata_lmin, 1);
-    Serial.println(" L/min         ║");
-    Serial.println("╠═══════════════════════════════════════╣");
-    Serial.println("║ Comandi:                              ║");
-    Serial.println("║  P<valore>  → portata L/min (2-25)   ║");
-    Serial.println("║  ?          → mostra questo menu     ║");
-    Serial.println("╚═══════════════════════════════════════╝");
-    Serial.println();
-}
-
-void gestisci_serial() {
-    if (!Serial.available()) return;
-    String cmd = Serial.readStringUntil('\n');
-    cmd.trim();
-    if (cmd.length() == 0) return;
-
-    char tipo = toupper(cmd.charAt(0));
-    float val = (cmd.length() > 1) ? cmd.substring(1).toFloat() : 0.0f;
-
-    if (tipo == 'P') {
-        if (val >= 2.0f && val <= 25.0f) {
-            portata_lmin = val;
-            aggiorna_parametri();
-            Serial.print(">> Portata impostata: ");
-            Serial.print(portata_lmin, 1);
-            Serial.println(" L/min");
-        } else {
-            Serial.println(">> Errore: portata deve essere 2-25 L/min");
+void gestisciSerial() {
+    while (Serial.available()) {
+        String input = Serial.readStringUntil('\n');
+        input.trim();
+        if (input.length() < 2) {
+            if (input == "?") stampaMenu();
+            continue;
         }
-    } else if (tipo == '?') {
-        stampa_menu();
-    } else {
-        Serial.println(">> Comando non riconosciuto. Digita ? per aiuto.");
+
+        char cmd = toupper(input.charAt(0));
+        float val = input.substring(1).toFloat();
+
+        switch (cmd) {
+            case 'T': p_temp_rete = val;    break;
+            case 'L': p_portata = val;      break;
+            case 'A': p_massa_acqua = val;  break;
+            case 'R': p_pot_risc = val;     break;
+            case 'F': p_pot_raff = val;     break;
+            case 'S': p_pot_stampo = val;   break;
+            case '?': stampaMenu(); break;
+        }
+        if (cmd != '?') Serial.printf(">>> Parametro %c aggiornato a %.1f\n", cmd, val);
     }
 }
 
-// ── SETUP ─────────────────────────────────────────────────────
+// ==============================================================
+//  SETUP
+// ==============================================================
 void setup() {
     Serial.begin(115200);
     analogSetAttenuation(ADC_11db);
-    pinMode(PIN_FREDDO, INPUT_PULLUP);
-    pinMode(CS_USCITA,  OUTPUT); digitalWrite(CS_USCITA,  HIGH);
+
+    pinMode(PIN_RAFFREDDAMENTO, INPUT_PULLUP);
+    pinMode(CS_MANDATA, OUTPUT); digitalWrite(CS_MANDATA, HIGH);
     pinMode(CS_RITORNO, OUTPUT); digitalWrite(CS_RITORNO, HIGH);
+
     SPI.begin();
-
-    aggiorna_parametri();
-    stampa_menu();
-
-    Serial.println("T_usc  | T_rend | T_rete | Caldo% | Freddo | P_risc  | P_raff  | P_disp | P_stampo");
-    Serial.println("-------|--------|--------|--------|--------|---------|---------|--------|----------");
+    stampaMenu();
 }
 
-// ── LOOP ──────────────────────────────────────────────────────
+// ==============================================================
+//  LOOP FISICO (IL CICLO DELL'ACQUA)
+// ==============================================================
 void loop() {
-    gestisci_serial();
+    gestisciSerial();
 
     unsigned long now = millis();
-    if (now - t_last < INTERVALLO_MS) return;
-    float dt = (float)(now - t_last) * 0.001f;
+    if (now - t_last < 100) return; 
+    float dt = (now - t_last) * 0.001f;
     t_last = now;
 
-    // ── Lettura segnali ───────────────────────────────────────
-    float frac_caldo = leggi_caldo();
-    bool  freddo_on  = (digitalRead(PIN_FREDDO) == LOW);
-    temp_ritorno     = leggi_ritorno();   // = temperatura acqua di rete
+    if (p_massa_acqua < 0.1f) p_massa_acqua = 0.1f; 
+    float portata_kgs = p_portata / 60.0f;
+    if (portata_kgs < 0.01f) portata_kgs = 0.01f;
 
-    // ── Calcolo potenze ───────────────────────────────────────
-    float Q_risc  = pot_riscaldante(frac_caldo);
-    float Q_raff  = pot_raffreddamento(freddo_on, temp_acqua, temp_ritorno);
-    float Q_disp  = pot_dispersione_tubi(temp_acqua);
-    float Q_stamp = pot_scambio_stampo(Q_risc, Q_raff, Q_disp);
+    // --- 1. LETTURA AZIONI MACCHINA (PID) ---
+    float frac_caldo = leggiComandoRiscaldo();
+    bool  raffreddo_on = (digitalRead(PIN_RAFFREDDAMENTO) == LOW);
 
-    // ── Fisica dell'acqua ─────────────────────────────────────
-
-    // Riscaldamento proporzionale alla potenza CN-106
-    temp_acqua += risc_rate * frac_caldo * dt;
-
-    // Raffreddamento scambiatore (proporzionale a ΔT con rete)
-    if (freddo_on && temp_acqua > temp_ritorno) {
-        float deltaT   = temp_acqua - temp_ritorno;
-        float rate_eff = raff_base * deltaT / 80.0f;
-        temp_acqua -= rate_eff * dt;
+    float Q_in  = frac_caldo * p_pot_risc; 
+    float Q_out = 0.0f;                    
+    
+    if (raffreddo_on && temp_serbatoio > p_temp_rete) {
+        Q_out = p_pot_raff;
+        float max_q = (temp_serbatoio - p_temp_rete) * p_massa_acqua * CP_ACQUA / dt;
+        if (Q_out > max_q) Q_out = max_q; 
     }
 
-    // Dispersione tubi (Newton, valore fisso non parametrizzabile)
-    float disp = K_DISPERSIONE_TUBI * (temp_acqua - TEMP_AMBIENTE) * dt;
-    if (disp > 0.0f) temp_acqua -= disp;
+    // --- 2. IL PERCORSO DELL'ACQUA (LOOP) ---
+    float t_mandata_reale = temp_serbatoio;
+    
+    // Lo stampo inietta o estrae la potenza S istantaneamente dall'acqua
+    float delta_T_stampo = p_pot_stampo / (portata_kgs * CP_ACQUA);
+    float t_ritorno_reale = t_mandata_reale + delta_T_stampo;
 
-    // Limiti fisici
-    if (freddo_on && temp_acqua < temp_ritorno) temp_acqua = temp_ritorno;
-    if (temp_acqua < TEMP_AMBIENTE) temp_acqua = TEMP_AMBIENTE;
-    if (temp_acqua > TEMP_MAX)      temp_acqua = TEMP_MAX;
+    // L'acqua rientra nel serbatoio interno portando con sé l'energia acquisita/persa
+    float pot_ingresso_ritorno = portata_kgs * CP_ACQUA * (t_ritorno_reale - temp_serbatoio);
 
-    // ── Inerzia sonda ─────────────────────────────────────────
-    temp_sonda += (temp_acqua - temp_sonda) * VELOCITA_SONDA * dt;
+    // Bilancio totale del serbatoio: Energia di Ritorno + Resistenze - Scambiatore
+    float pot_netta_serbatoio = pot_ingresso_ritorno + Q_in - Q_out;
+    temp_serbatoio += (pot_netta_serbatoio / (p_massa_acqua * CP_ACQUA)) * dt;
 
-    // ── Aggiorna MCP4261 ──────────────────────────────────────
-    float    r_usc = calcolo_resistenza_ideale(temp_sonda);
-    bytes8_t p_usc = trova_potenziometri(r_usc);
-    scriviWiper(CS_USCITA, p_usc.p1, p_usc.p2);
+    // --- 3. INERZIA SONDE E SPI ---
+    temp_sonda_mandata += (t_mandata_reale - temp_sonda_mandata) * 0.2f * dt;
+    temp_sonda_ritorno += (t_ritorno_reale - temp_sonda_ritorno) * 0.2f * dt;
 
-    float    r_rit = calcolo_resistenza_ideale(temp_ritorno);
-    bytes8_t p_rit = trova_potenziometri(r_rit);
-    scriviWiper(CS_RITORNO, p_rit.p1, p_rit.p2);
+    inviaWiper(CS_MANDATA, trovaPassiPotenziometro(tempAResistenza(temp_sonda_mandata)));
+    inviaWiper(CS_RITORNO, trovaPassiPotenziometro(tempAResistenza(temp_sonda_ritorno)));
 
-    // ── Serial ogni 1s ────────────────────────────────────────
-    if (now - t_serial >= 1000) {
-        t_serial = now;
-        // Temperature
-        Serial.print(temp_acqua,  1); Serial.print("C  | ");
-        Serial.print(temp_sonda,  1); Serial.print("C  | ");
-        Serial.print(temp_ritorno,1); Serial.print("C  | ");
-        // Segnali
-        Serial.print(frac_caldo*100.0f,0); Serial.print("%  | ");
-        Serial.print(freddo_on ? "ON     | " : "off    | ");
-        // Potenze [W]
-        Serial.print(Q_risc,  0); Serial.print("W  | ");
-        Serial.print(Q_raff,  0); Serial.print("W  | ");
-        Serial.print(Q_disp,  0); Serial.print("W  | ");
-        Serial.print(Q_stamp, 0); Serial.println("W");
+    // --- 4. LOG CONSOLE ---
+    if (now - t_log >= 2000) {
+        t_log = now;
+        Serial.printf("MACCHINA:[Risc: %3.0f%% | Raff: %s]  --->  ACQUA:[Mandata: %5.1f°C | Ritorno: %5.1f°C] | Stampo: %+.0fW\n",
+                      frac_caldo * 100.0f,
+                      raffreddo_on ? "ON " : "OFF",
+                      temp_sonda_mandata, 
+                      temp_sonda_ritorno,
+                      p_pot_stampo);
     }
 }
