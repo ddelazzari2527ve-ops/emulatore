@@ -23,32 +23,21 @@ inline float potenzaRiscaldo(float fraz_caldo, float p_max_w) {
 
 // ── Potenza di raffreddamento per iniezione diretta acqua di rete ─────────────
 //
-//  Modello fisico: Q = portata_kgs × CP_ACQUA × (T_serb − T_rete)
-//
-//  La potenza è proporzionale a ΔT → il serbatoio decade esponenzialmente
-//  verso T_rete con costante di tempo τ = m_acqua / portata_kgs.
-//  Quando T_serb → T_rete il flusso si azzera da solo: nessun clamp artificiale.
-//
-//  portata_kgs = p_portata_valvola [L/min] / 60   (convertita in kg/s)
-//
-//  Questa funzione è usata per:
-//    • raffreddamento normale (hardware PIN o comando RAFFREDDAMENTO)
-//    • iniezione ACQUA (stessa valvola, 3 secondi)
-//  Per PERDITA si usa una portata fissa piccola (PORTATA_PERDITA_LMIN).
+//  Modello fisico a bilancio di massa: Q = m_dot * Cp * (T_serb - T_rete)
+//  Eliminati limiti arbitrari p_pot_raff. La potenza dipende solo dalla fisica.
 //
 inline float potenzaRaffreddamento(bool  valvola_aperta,
                                    float t_serbatoio,
                                    float t_rete,
                                    float portata_kgs)
 {
-    if (!valvola_aperta || t_serbatoio <= t_rete + 0.05f) return 0.0f;
+    if (!valvola_aperta || t_serbatoio <= t_rete) return 0.0f;
     return portata_kgs * CP_ACQUA * (t_serbatoio - t_rete);
 }
 
-// ── Dispersione termica nei tubi verso l'ambiente ────────────────────────────
+// ── Dispersione termica proporzionale al salto termico ────────────────────────
 inline float dispersioneTubi(float t_fluido) {
-    float dT = t_fluido - p_temp_ambiente;
-    return (dT > 0.0f) ? p_k_disp_tubi * dT : 0.0f;
+    return p_k_disp_tubi * (t_fluido - p_temp_ambiente);
 }
 
 // ── Ricerca binaria nella tabella potenziometro ──────────────────────────────
