@@ -77,7 +77,7 @@ extern float p_temp_rete;
 extern float p_portata;
 extern float p_massa_acqua;
 extern float p_pot_risc;
-extern float p_pot_raff;
+extern float p_k_hx;           // [W/°C] Coefficiente scambio termico HX (ex p_pot_raff)
 extern float p_pot_stampo;
 extern float p_temp_ambiente;
 extern float p_k_disp_tubi;
@@ -85,7 +85,7 @@ extern float p_k_disp_serbatoio;
 extern float p_massa_stampo;
 extern float K_stampo;
 extern float ff_gain;
-extern float p_portata_valvola;
+extern float p_portata_valvola; // [L/min] Solo per iniezione diretta acqua di rete
 
 // ══════════════════════════════════════════════════════════════════
 //  STATO TERMODINAMICO — definito in EFP.ino
